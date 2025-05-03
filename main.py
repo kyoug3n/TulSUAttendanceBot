@@ -11,7 +11,7 @@ from typing import Optional
 
 import pandas as pd
 from aiogram import Bot, Dispatcher, Router, exceptions, types
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from dotenv import load_dotenv
@@ -33,8 +33,8 @@ NAME_PATTERN = re.compile(r'^[А-Яа-яЁё-]+$')
 
 
 class Registration(StatesGroup):
-    first_name = State()
     last_name = State()
+    first_name = State()
 
 
 def valid_name(name: str) -> bool:
@@ -44,21 +44,16 @@ def valid_name(name: str) -> bool:
     )
 
 
-@router.message(Command('start', 'edit_name', 'display_name'))
-async def cancel_state(message: types.Message, state: FSMContext) -> None:
-    current_state = await state.get_state()
-    if current_state:
-        await state.clear()
-
-
 @router.message(Command('start'))
 async def cmd_start(message: types.Message, state: FSMContext) -> None:
+    await state.clear()
+
     user_id = str(message.from_user.id)
     user = await storage.get_user(user_id)
 
     if message.chat.type == 'private' and (not user or not user.get('registered', False)):
-        await message.answer('Введите ваше имя (одно слово на кириллице):')
-        await state.set_state(Registration.first_name)
+        await message.answer('Введите вашу фамилию (одно слово на кириллице):')
+        await state.set_state(Registration.last_name)
     else:
         start_time = time.monotonic()
         response = await message.answer('Bot running!')
@@ -73,34 +68,24 @@ async def cmd_start(message: types.Message, state: FSMContext) -> None:
 
 @router.message(Command('edit_name'))
 async def cmd_edit_name(message: types.Message, state: FSMContext) -> None:
+    await state.clear()
+
     if message.chat.type == 'private':
-        await message.answer('Введите ваше имя (одно слово, кириллица):')
+        await message.answer('Введите вашу фамилию (одно слово на кириллице):')
         await state.set_state(Registration.first_name)
 
 
 @router.message(Command('display_name'))
-async def cmd_display_name(message: types.Message) -> None:
+async def cmd_display_name(message: types.Message, state: FSMContext) -> None:
+    await state.clear()
+
     user_id = str(message.from_user.id)
     user = await storage.get_user(user_id)
 
-    fn = user.get('first_name', 'не указано') if user else 'не указано'
     ln = user.get('last_name', 'не указана') if user else 'не указана'
+    fn = user.get('first_name', 'не указано') if user else 'не указано'
 
-    await message.answer(f'Ваше имя: {fn} {ln}.')
-
-
-@router.message(Registration.first_name)
-async def handle_first_name(message: types.Message, state: FSMContext) -> Optional[types.Message]:
-    fn = message.text.strip()
-    if not valid_name(fn):
-        return await message.answer(
-            'Имя должно состоять из одного слова на кириллице. Пожалуйста, введите корректное имя:'
-        )
-
-    await state.update_data(first_name=fn)
-    await message.answer('Отлично! Теперь введите вашу фамилию (одно слово, кириллица):')
-
-    return await state.set_state(Registration.last_name)
+    await message.answer(f'Ваше имя: {ln} {fn}.')
 
 
 @router.message(Registration.last_name)
@@ -111,23 +96,42 @@ async def handle_last_name(message: types.Message, state: FSMContext) -> Optiona
             'Фамилия должна состоять из одного слова на кириллице. Пожалуйста, введите корректную фамилию:'
         )
 
+    await state.update_data(first_name=ln)
+    await message.answer('Отлично! Теперь введите ваше имя (одно слово на кириллице):')
+
+    return await state.set_state(Registration.first_name)
+
+
+@router.message(Registration.first_name)
+async def handle_first_name(message: types.Message, state: FSMContext) -> Optional[types.Message]:
+    fn = message.text.strip()
+    if not valid_name(fn):
+        return await message.answer(
+            'Имя должно состоять из одного слова на кириллице. Пожалуйста, введите корректное имя:'
+        )
+
     data = await state.get_data()
     user_id = str(message.from_user.id)
 
     await storage.update_user(user_id, {
         "username": message.from_user.username,
-        "first_name": data["first_name"],
-        "last_name": ln,
+        "last_name": data['last_name'],
+        "first_name": fn,
         "registered": True
     })
 
-    await message.answer(f"Спасибо, {data['first_name']} {ln}! Ваши данные сохранены.")
+    await message.answer(f"Спасибо, {data['last_name']} {fn}! Ваши данные сохранены.")
     await state.clear()
-    return None
 
 
 @router.message(Command('export_attendance'))
-async def cmd_export_attendance(message: types.Message) -> Optional[types.Message]:
+async def cmd_export_attendance(message: types.Message, state: FSMContext) -> Optional[types.Message]:
+    admins: list[int] = [int(x.strip()) for x in str(os.getenv('ATTENDANCE_ACCESS'))[1:-1].split(',')]
+
+    if not (message.chat.type == 'private' and message.from_user.id in admins):
+        await message.answer('Эта команда доступна только администраторам.')
+        return await state.clear()
+
     parts = message.text.strip().split()
     now = datetime.now()
     year, month = now.year, now.month
@@ -148,17 +152,17 @@ async def cmd_export_attendance(message: types.Message) -> Optional[types.Messag
     with pd.ExcelWriter(output, engine='openpyxl') as writer:  # type: ignore
         df_polls = pd.DataFrame(polls)
         for date_val, group in df_polls.groupby('date', sort=True):
-            date_str = str(date_val)                     # ensure it's a Python str
-            sheet_name = date_str.replace('.', '-')[:31]  # Excel sheet names max length 31
+            date_str = str(date_val)
+            sheet_name = date_str.replace('.', '-')[:31]
 
             records: dict[str, dict[str,str]] = {}
             classes: set[str] = set()
 
             for _, row in group.iterrows():
-                cls = row['class_name']
+                cls = f'{row['class_name']} ({row["start_time"]} - {row["end_time"]})'
                 classes.add(cls)
                 for resp in json.loads(row['responses']):
-                    name = resp['first_name'] + ' ' + resp['last_name']
+                    name = resp['last_name'] + ' ' + resp['first_name']
                     opt = resp['option_ids'][0] if resp['option_ids'] else None
                     mark = {0: 'Д', 1: 'Н', 2: 'П', 3: 'Б'}.get(opt, '')
                     records.setdefault(name, {})[cls] = mark
@@ -166,12 +170,13 @@ async def cmd_export_attendance(message: types.Message) -> Optional[types.Messag
             classes_list = sorted(classes)
             table = []
             for student, answers in records.items():
-                row_dict = {'Студент': student}
+                row_dict = {'Имя': student}
                 for cls in classes_list:
                     row_dict[cls] = answers.get(cls, '')
                 table.append(row_dict)
 
-            df_day = pd.DataFrame(table, columns=['Студент'] + classes_list)
+            df_day = pd.DataFrame(table, columns=['Имя'] + classes_list)
+            df_day = df_day.sort_values(by='Имя', ascending=False)
             df_day.to_excel(writer, sheet_name=sheet_name, index=False)
 
             ws = writer.sheets[sheet_name]
@@ -203,7 +208,10 @@ def register_handlers(router_instance: Router, storage_instance: StorageManager,
         uid_str = str(uid)
         opts = poll_answer.option_ids
 
-        fn, ln = poll_answer.user.first_name, poll_answer.user.last_name or ''
+        if local_user_info := await storage_instance.get_user(uid_str):
+            fn, ln = local_user_info.get('first_name', ''), local_user_info.get('last_name', '')
+        else:
+            fn, ln = poll_answer.user.first_name, poll_answer.user.last_name or ''
         username = f'@{poll_answer.user.username}' if poll_answer.user.username else ''
 
         await storage_instance.update_poll_response(

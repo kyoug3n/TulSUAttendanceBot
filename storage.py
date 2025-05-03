@@ -25,8 +25,8 @@ class StorageManager:
             CREATE TABLE IF NOT EXISTS user_data (
                 user_id    TEXT PRIMARY KEY,
                 username   TEXT,
-                first_name TEXT CHECK(first_name GLOB '[А-Яа-яЁё -]*'),
                 last_name  TEXT CHECK(last_name GLOB '[А-Яа-яЁё -]*'),
+                first_name TEXT CHECK(first_name GLOB '[А-Яа-яЁё -]*'),
                 registered INTEGER DEFAULT 0
             ) WITHOUT ROWID;
         ''')
@@ -68,20 +68,20 @@ class StorageManager:
     async def get_user(self, user_id: str) -> Optional[Dict[str, Any]]:
         async with self.conn.execute('''
             SELECT * FROM user_data WHERE user_id = ?
-        ''', user_id) as cursor:
+        ''', (user_id,)) as cursor:
             row = await cursor.fetchone()
             return dict(row) if row else None
 
     async def update_user(self, user_id: str, data: Dict[str, Any]):
         await self.conn.execute('''
             INSERT OR REPLACE INTO user_data 
-            (user_id, username, first_name, last_name, registered)
+            (user_id, username, last_name, first_name, registered)
             VALUES (?, ?, ?, ?, ?)
         ''', (
             user_id,
             data.get('username'),
-            data.get('first_name'),
             data.get('last_name'),
+            data.get('first_name'),
             1 if data.get('registered') else 0
         ))
 
@@ -224,7 +224,7 @@ class StorageManager:
         else:
             end = f"{year:04d}-{month+1:02d}-01"
         query = """
-            SELECT date, class_name, responses 
+            SELECT date, start_time, end_time, class_name, responses 
             FROM past_polls
             WHERE close_time >= ? AND close_time < ?
             ORDER BY date, start_time

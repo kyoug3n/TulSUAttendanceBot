@@ -41,7 +41,10 @@ class Scheduler:
             self.active_polls.clear()
             for poll_id, row in rows.items():
 
-                class_info = {k: row[k] for k in ['date', 'start_time', 'end_time', 'class_name', 'prof', 'room', 'class_type']}
+                class_info = {
+                    k: row[k] for k in
+                    ['date', 'start_time', 'end_time', 'class_name', 'prof', 'room', 'class_type']
+                }
                 raw_close = row.get('close_time')
                 if isinstance(raw_close, str):
                     try:
