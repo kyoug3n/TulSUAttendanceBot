@@ -4,8 +4,8 @@ import datetime
 def get_test_schedule():
     now = datetime.datetime.now()
 
-    start = now + datetime.timedelta(minutes=5)
-    end = start + datetime.timedelta(minutes=10)
+    start = now + datetime.timedelta(minutes=1)
+    end = start + datetime.timedelta(minutes=2)
     date_str = start.strftime('%d.%m.%Y')
     time_str = f"{start.strftime('%H:%M')} - {end.strftime('%H:%M')}"
 

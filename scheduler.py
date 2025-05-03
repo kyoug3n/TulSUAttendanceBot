@@ -1,164 +1,191 @@
-import os
-import json
 import asyncio
 import datetime
 import logging
+from typing import Any
 
+from aiogram import exceptions
+from aiohttp import ClientSession
 from parser import ScheduleParser
+from storage import StorageManager
 
 
 class Scheduler:
-    def __init__(self, bot, chat_id):
+    def __init__(
+            self,
+            bot,
+            chat_id: int,
+            group_id: int,
+            storage: StorageManager,
+            poll_interval: float,
+            update_interval: float,
+            poll_window: float
+    ) -> None:
         self.bot = bot
-        self.chat_id: int = chat_id
+        self.chat_id = chat_id
+        self.group_id = group_id
+        self.storage = storage
+        self.session = ClientSession()
+        self.parser = ScheduleParser(self.group_id, self.session)
+        self.poll_interval = poll_interval
+        self.update_interval = update_interval
+        self.poll_window = poll_window
+
         self.logger = logging.getLogger(__name__)
-        self.active_polls: dict[str, dict] = {} # format: date|start_time|class_name
-        self.polls_file: str = 'active_polls.json'
-        self.schedule_parser = ScheduleParser(self.chat_id)
-        self.load_active_polls()
+        self.active_polls: dict[str, Any] = {}
+        self.semaphore = asyncio.Semaphore(3)
+        self._running = False
 
-    def load_active_polls(self):
-        if os.path.exists(self.polls_file):
-            try:
-                with open(self.polls_file, 'r') as f:
-                    data = json.load(f)
-
-                for key, poll_info in data.items():
-                    if 'close_time' in poll_info:
-                        poll_info['close_time'] = datetime.datetime.fromisoformat(poll_info['close_time'])
-                self.active_polls = data
-                self.logger.info('Active polls loaded.')
-            except Exception as e:
-                self.logger.error(f'Error loading active polls: {e}')
-                self.active_polls = {}
-        else:
-            self.active_polls = {}
-
-    def save_active_polls(self):
+    async def _load_active_polls(self) -> None:
         try:
-            save_buffer = {}
+            rows = await self.storage.get_active_polls()
+            self.active_polls.clear()
+            for poll_id, row in rows.items():
 
-            for key, poll_info in self.active_polls.items():
-                poll_info_copy = poll_info.copy()
-                if 'close_time' in poll_info_copy and isinstance(poll_info_copy['close_time'], datetime.datetime):
-                    poll_info_copy['close_time'] = poll_info_copy['close_time'].isoformat()
-                save_buffer[key] = poll_info_copy
+                class_info = {k: row[k] for k in ['date', 'start_time', 'end_time', 'class_name', 'prof', 'room', 'class_type']}
+                raw_close = row.get('close_time')
+                if isinstance(raw_close, str):
+                    try:
+                        # noinspection PyUnusedLocal
+                        close_time = datetime.datetime.fromisoformat(raw_close)
+                    except ValueError:
+                        close_time = datetime.datetime.strptime(raw_close, "%Y-%m-%d %H:%M:%S")
+                else:
+                    close_time = raw_close
 
-            with open(self.polls_file, 'w') as f:
-                json.dump(save_buffer, f)
-        except (IOError, OSError) as e:
-            self.logger.error(f'Error writing to file: {e}')
+                record = {
+                    'poll_id': row['poll_id'],
+                    'message_id': row['message_id'],
+                    'class_info': class_info,
+                    'close_time': close_time,
+                    'responses': row.get('responses', '[]')
+                }
+                key = self._generate_key(class_info)
+                self.active_polls[key] = record
+            self.logger.info(f"Loaded {len(self.active_polls)} active polls from DB")
         except Exception as e:
-            self.logger.error(f'Error saving active polls: {e}')
+            self.logger.error(f"Failed loading active polls: {e}")
+            self.active_polls.clear()
 
-    async def fetch_schedule_task(self):
-        while True:
-            await self.schedule_parser.fetch_schedule()
-            await asyncio.sleep(1800)
+    def _generate_key(self, cls: dict[str, Any]) -> str:
+        return f"{cls['date']}|{cls['start_time']}|{cls['class_name']}"
 
-    async def check_classes_task(self):
-        while True:
-            now = datetime.datetime.now()
-            current_date = now.strftime('%d.%m.%Y')
-            await self._process_upcoming_classes(now, current_date)
-            await self._update_expired_polls(now)
-            await asyncio.sleep(60)
+    async def _check_and_send_polls(self, now: datetime.datetime) -> None:
+        today = now.strftime("%d.%m.%Y")
+        classes = self.parser.schedule.get(today, [])
 
-    async def _process_upcoming_classes(self, now: datetime.datetime, current_date: str):
-        classes = self.schedule_parser.schedule.get(current_date, [])
         for cls in classes:
-            key = f'{current_date}|{cls['start_time']}|{cls['class_name']}'
+            key = self._generate_key(cls)
             if key in self.active_polls:
                 continue
+            class_dt = datetime.datetime.strptime(f"{cls['date']} {cls['start_time']}", "%d.%m.%Y %H:%M")
+            if 0 <= (class_dt - now).total_seconds() <= self.poll_window:
+                await self._send_poll(cls, key)
+
+        await self._close_expired(now)
+
+    async def _send_poll(self, cls: dict[str, Any], key: str) -> None:
+        async with self.semaphore:
+            try:
+                question = f"{cls['class_name']} в {cls['start_time']} - {cls['end_time']}"
+                msg = await self.bot.send_poll(
+                    chat_id=self.chat_id,
+                    question=question,
+                    options=['Да', 'Нет', 'Пикнулся', 'На больничном'],
+                    is_anonymous=False,
+                    allows_multiple_answers=False,
+                )
+                close_time = self._calculate_close_time(cls)
+                info = {
+                    'poll_id': msg.poll.id,
+                    'message_id': msg.message_id,
+                    'class_info': cls,
+                    'close_time': close_time,
+                    'responses': '[]'
+                }
+                self.active_polls[key] = info
+                await self.storage.save_active_polls(info['poll_id'], info)
+                self.logger.info(f"Sent poll: {key}")
+            except Exception as e:
+                self.logger.error(f"Error sending poll {key}: {e}")
+
+    def _calculate_close_time(self, cls: dict[str, Any]) -> datetime.datetime:
+        date = datetime.datetime.strptime(cls['date'], "%d.%m.%Y").date()
+        end = datetime.datetime.strptime(cls['end_time'], "%H:%M").time()
+        close = datetime.datetime.combine(date, end)
+        start = datetime.datetime.strptime(cls['start_time'], "%H:%M").time()
+
+        if end <= start:
+            close += datetime.timedelta(days=1)
+        return close
+
+    async def _close_expired(self, now: datetime.datetime):
+        expired_keys = []
+        for key, info in list(self.active_polls.items()):
+            if now >= info['close_time']:
+                if await self._close_poll(info):
+                    expired_keys.append(key)
+        for key in expired_keys:
+            self.active_polls.pop(key, None)
+
+    async def _close_poll(self, info: dict[str, Any]) -> bool:
+        pid = info['poll_id']
+        async with self.semaphore:
+            try:
+                await self.bot.stop_poll(chat_id=self.chat_id, message_id=info['message_id'])
+            except exceptions.TelegramBadRequest as e:
+                msg = str(e)
+                if 'has already been closed' in msg:
+                    self.logger.warning(f"Poll {pid} already closed: {msg}")
+                    try:
+                        await self.storage.archive_poll(pid)
+                        self.logger.info(f"Archived already closed poll {pid}")
+                    except Exception as e:
+                        self.logger.error(f"Error archiving already closed poll {pid}: {e}")
+                    return True
+                if 'message with poll to stop not found' in msg:
+                    self.logger.warning(f"Poll {pid} not found; deleting from storage")
+                    try:
+                        await self.storage.delete_poll(pid)
+                        self.logger.info(f"Deleted poll {pid} from both active and past tables")
+                    except Exception as e:
+                        self.logger.error(f"Error deleting poll {pid}: {e}")
+                    return True
+                self.logger.error(f"BadRequest closing poll {pid}: {msg}")
+                return False
 
             try:
-                class_time = datetime.datetime.strptime(
-                    f'{current_date} {cls['start_time']}', '%d.%m.%Y %H:%M'
-                )
+                await self.storage.archive_poll(pid)
+                self.logger.info(f"Closed and archived poll {pid}")
+                return True
             except Exception as e:
-                self.logger.error(f'Error parsing class time: {e}')
-                continue
+                self.logger.error(f"Error archiving poll {pid}: {e}")
+                return False
 
-            if 0 <= (class_time - now).total_seconds() <= 300 and key not in self.active_polls:
-                await self._send_poll(current_date, cls, key)
+    async def start(self) -> None:
+        self._running = True
 
+        await self._load_active_polls()
+        await self.parser.fetch()
+        last_update = datetime.datetime.now()
+        self.logger.info("Initial schedule fetched")
 
-    async def _send_poll(self, current_date: str, cls: dict, key: str):
-        question = f'{cls['class_name']} в {cls['start_time']} - {cls['end_time']}'
-        options = ['Да', 'Сосал']
-        try:
-            message = await self.bot.send_poll(
-                chat_id=self.chat_id,
-                question=question,
-                options=options,
-                is_anonymous=False,
-                allows_multiple_answers=False,
-            )
+        while self._running:
+            try:
+                now = datetime.datetime.now()
 
-            class_date = datetime.datetime.strptime(current_date, '%d.%m.%Y').date()
-            start_time_obj = datetime.datetime.strptime(cls['start_time'], "%H:%M").time()
-            end_time_obj = datetime.datetime.strptime(cls['end_time'], "%H:%M").time()
+                if (now - last_update).total_seconds() >= self.update_interval:
+                    await self.parser.fetch()
+                    last_update = now
+                    self.logger.info("Schedule updated")
 
-            start_datetime = datetime.datetime.combine(class_date, start_time_obj)
-            close_datetime = datetime.datetime.combine(class_date, end_time_obj)
+                await self._check_and_send_polls(now)
 
-            if close_datetime <= start_datetime:
-                close_datetime += datetime.timedelta(days=1)
+            except Exception as e:
+                self.logger.error(f"Scheduler loop error: {e}")
 
-            poll_info = {
-                'poll_id': message.poll.id,
-                'message_id': message.message_id,
-                'class_info': cls,
-                'close_time': close_datetime,
-                'date': current_date
-            }
-            self.active_polls[key] = poll_info
-            self.save_active_polls()
-            self.logger.info(f'Poll created for class {key}')
-        except Exception as e:
-            self.logger.error(f'Error sending poll for class {key}: {e}')
+            await asyncio.sleep(self.poll_interval)
 
-    async def _update_expired_polls(self, now: datetime.datetime):
-        expired_keys = []
-        for poll_key, poll_info in self.active_polls.items():
-            if now >= poll_info['close_time']:
-                await self._close_poll(poll_key, poll_info)
-                expired_keys.append(poll_key)
-        for key in expired_keys:
-            del self.active_polls[key]
-        if expired_keys:
-            self.save_active_polls()
-
-    async def _close_poll(self, poll_key: str, poll_info: dict):
-        try:
-            stopped_poll = await self.bot.stop_poll(
-                chat_id=self.chat_id,
-                message_id=poll_info['message_id']
-            )
-            total_members = await self.bot.get_chat_member_count(chat_id=self.chat_id)
-            votes = {option.text: option.voter_count for option in stopped_poll.options}
-            answered = sum(votes.values())
-            didnt_attend = votes.get('Сосал', 0)
-            not_answered = total_members - answered
-
-            stats_text = (
-                f'Результаты опроса для пары:\n'
-                f'{poll_info['class_info']['class_name']} в {poll_info['class_info']['start_time']}\n\n'
-                f'Проголосовало: {answered} из {total_members}\n'
-                f'Не посетили: {didnt_attend}\n'
-                f'Не ответили: {not_answered}'
-            )
-            await self.bot.send_message(
-                chat_id=self.chat_id,
-                reply_to_message_id=poll_info['message_id'],
-                text=stats_text
-            )
-            self.logger.info(f'Poll closed for class {poll_key}')
-        except Exception as e:
-            self.logger.error(f'Error closing poll for class {poll_key}: {e}')
-
-    async def start(self):
-        await asyncio.gather(
-            self.fetch_schedule_task(),
-            self.check_classes_task()
-        )
+    async def shutdown(self):
+        self._running = False
+        await self.session.close()
+        await self.storage.close()
