@@ -11,7 +11,7 @@ from typing import Optional
 
 import pandas as pd
 from aiogram import Bot, Dispatcher, Router, exceptions, types
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from dotenv import load_dotenv
