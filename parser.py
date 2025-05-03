@@ -1,80 +1,75 @@
-import asyncio
 import os
 from collections import defaultdict
-import datetime
 import logging
-from typing import Any
+from datetime import datetime as dt, time
+from typing import Any, Final
 
-import requests
+import aiohttp
 
 import test_schedule
 
 
 class ScheduleParser:
-    def __init__(self, group_id: int):
+    API_ENDPOINT: Final[str] = 'https://tulsu.ru/schedule/queries/GetSchedule.php'
+    DATE_FORMAT: Final[str] = '%d.%m.%Y'
+    TIME_FORMAT: Final[str] = '%H:%M'
+
+    def __init__(self, group_id: int, session: aiohttp.ClientSession):
         self.logger = logging.getLogger(__name__)
-        self.api_endpoint = 'https://tulsu.ru/schedule/queries/GetSchedule.php'
         self.group_id = group_id
-        self.raw_schedule: list[dict[str, Any]] = []
-        self.sorted_schedule: list[dict[str, Any]] = []
-        self.schedule: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+        self.session = session
+        self.schedule = defaultdict(list)
 
-    async def fetch_schedule(self):
-        try:
-            if os.getenv('TEST_MODE', 'False').lower() in ('true', '1'):
-                web_schedule = test_schedule.get_test_schedule()
-                self.raw_schedule = [self.parse_class(class_data) for class_data in web_schedule]
-                print(self.raw_schedule)
-                self.logger.info('Test schedule loaded.')
-            else:
-                params = {
-                    'search_field': 'GROUP_P',
-                    'search_value': self.group_id
-                }
-                response = await asyncio.to_thread(requests.get, self.api_endpoint, timeout=10, params=params)
-                response.raise_for_status()
-                web_schedule = response.json()
-                print(web_schedule)
-                self.raw_schedule = [self.parse_class(class_data) for class_data in web_schedule]
-                self.logger.info('Schedule updated successfully.')
-            self.sort_and_group_classes()
-        except Exception as e:
-            self.logger.error(f'Error updating schedule: {e}')
+    async def fetch(self) -> dict[str, list[dict[str, Any]]]:
+        self.logger.info('Fetching schedule...')
+        raw_list: list[dict[str, Any]] = []  # TODO: add last schedule saving
 
+        # TEST MODE (classes 2 min from bot launch)
+        if os.getenv('TEST_MODE', 'False').lower() == 'true':
+            raw_list = test_schedule.get_test_schedule()
+        else:
+            # real API fetch
+            params = {'search_field': 'GROUP_P', 'search_value': self.group_id}
+            try:
+                async with self.session.get(self.API_ENDPOINT, params=params, timeout=10) as response:
+                    response.raise_for_status()
+                    raw_list = await response.json()
+            except aiohttp.web.HTTPException as e:
+                self.logger.error(f'Schedule fetch failed: {e}')
 
-    def sort_and_group_classes(self):
-        try:
-            self.sorted_schedule = sorted(
-                self.raw_schedule,
-                key=lambda cls: (
-                    datetime.datetime.strptime(cls['date'], '%d.%m.%Y'),
-                    datetime.datetime.strptime(cls['start_time'], '%H:%M'),
-                    datetime.datetime.strptime(cls['end_time'], '%H:%M')
-                )
-            )
-        except Exception as e:
-            self.logger.error(f'Error sorting schedule: {e}')
-            return
+        parsed = [self._parse_raw(item) for item in raw_list]
+        parsed.sort(key=self._sort_key)
 
-        self.schedule.clear()
-        for class_dict in self.sorted_schedule:
-            date = class_dict.get('date')
-            if date:
-                self.schedule[date].append(class_dict)
-                del class_dict['date']
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for entry in parsed:
+            grouped.setdefault(entry['date'], []).append(entry)
 
-    def parse_class(self, class_data: dict[str, Any]) -> dict[str, Any]:
-        time_range = class_data.get('TIME_Z', '')
-        time_range = time_range.split(' - ') if time_range else ''
-        start_time = time_range[0]
-        end_time = time_range[1]
+        self.schedule = grouped
+        self.logger.info('Schedule updated.')
+
+        return grouped
+
+    def _parse_raw(self, raw: dict[str, Any]) -> dict[str, Any]:
+        date = raw.get('DATE_Z', '')
+        time_range = raw.get('TIME_Z', '')
+        start_time, end_time = time_range.split(' - ')
 
         return {
-            'date': class_data.get('DATE_Z', ''),
+            'date': date,
             'start_time': start_time,
             'end_time': end_time,
-            'class_name': class_data.get('DISCIP', ''),
-            'prof': class_data.get('PREP', ''),
-            'room': class_data.get('AUD', ''),
-            'class_type': class_data.get('KOW', '')
+            'class_name': raw.get('DISCIP', ''),
+            'prof': raw.get('PREP', ''),
+            'room': raw.get('AUD', ''),
+            'class_type': raw.get('KOW', ''),
         }
+
+    def _sort_key(self, entry: dict[str, Any]) -> tuple[dt, time, time]:
+        try:
+            date = dt.strptime(entry['date'], self.DATE_FORMAT)
+            start = dt.strptime(entry['start_time'], self.TIME_FORMAT).time()
+            end = dt.strptime(entry['end_time'], self.TIME_FORMAT).time()
+            return date, start, end
+        except (ValueError, KeyError) as e:
+            self.logger.warning(f'Sorting error for entry {entry}: {e}')
+            return dt.max, time.max, time.max
