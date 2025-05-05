@@ -1,18 +1,17 @@
 import logging
 import json
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 import aiosqlite
 
 
 class StorageManager:
     DB_FILE = Path('db.sqlite3')
-    DB_AUTOSAVE_INTERVAL: int = 300
 
     def __init__(self):
         self.logger = logging.getLogger(__name__)
-        self.conn: Optional[aiosqlite.Connection] = None
+        self.conn: aiosqlite.Connection | None = None
 
     async def connect(self):
         self.conn = await aiosqlite.connect(self.DB_FILE)
@@ -65,14 +64,14 @@ class StorageManager:
 
         self.logger.info('DB initialized')
 
-    async def get_user(self, user_id: str) -> Optional[Dict[str, Any]]:
+    async def get_user(self, user_id: str) -> dict[str, Any] | None:
         async with self.conn.execute('''
             SELECT * FROM user_data WHERE user_id = ?
         ''', (user_id,)) as cursor:
             row = await cursor.fetchone()
             return dict(row) if row else None
 
-    async def update_user(self, user_id: str, data: Dict[str, Any]):
+    async def update_user(self, user_id: str, data: dict[str, Any]) -> None:
         await self.conn.execute('''
             INSERT OR REPLACE INTO user_data 
             (user_id, username, last_name, first_name, registered)
@@ -87,8 +86,8 @@ class StorageManager:
 
         await self.conn.commit()
 
-    async def get_active_polls(self) -> Dict[str, Any]:
-        polls: Dict[str, Any] = {}
+    async def get_active_polls(self) -> dict[str, Any]:
+        polls: dict[str, Any] = {}
         async with self.conn.execute('SELECT * FROM active_polls') as cursor:
             async for row in cursor:
                 rowdict = dict(row)
@@ -106,7 +105,7 @@ class StorageManager:
                 polls[rowdict['poll_id']] = rowdict
         return polls
 
-    async def save_active_polls(self, poll_id: str, data: Dict[str, Any]):
+    async def save_active_polls(self, poll_id: str, data: dict[str, Any]) -> None:
         class_info = data['class_info']
         responses = data.get('responses', '[]')
 

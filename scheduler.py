@@ -4,35 +4,27 @@ import logging
 from typing import Any
 
 from aiogram import exceptions
-from aiohttp import ClientSession
 from parser import ScheduleParser
 from storage import StorageManager
 
 
 class Scheduler:
     def __init__(
-            self,
-            bot,
-            chat_id: int,
-            group_id: int,
+            self, bot, chat_id: int, group_id: int,
             storage: StorageManager,
-            poll_interval: float,
-            update_interval: float,
-            poll_window: float
-    ) -> None:
+            poll_interval: float, update_interval: float, poll_window: float
+    ):
         self.bot = bot
         self.chat_id = chat_id
-        self.group_id = group_id
         self.storage = storage
-        self.session = ClientSession()
-        self.parser = ScheduleParser(self.group_id, self.session)
+        self.parser = ScheduleParser(group_id)
         self.poll_interval = poll_interval
         self.update_interval = update_interval
         self.poll_window = poll_window
 
         self.logger = logging.getLogger(__name__)
         self.active_polls: dict[str, Any] = {}
-        self.semaphore = asyncio.Semaphore(3)
+        self._semaphore = asyncio.Semaphore(3)
         self._running = False
 
     async def _load_active_polls(self) -> None:
@@ -87,7 +79,7 @@ class Scheduler:
         await self._close_expired(now)
 
     async def _send_poll(self, cls: dict[str, Any], key: str) -> None:
-        async with self.semaphore:
+        async with self._semaphore:
             try:
                 question = f"{cls['class_name']} в {cls['start_time']} - {cls['end_time']}"
                 msg = await self.bot.send_poll(
@@ -124,15 +116,14 @@ class Scheduler:
     async def _close_expired(self, now: datetime.datetime):
         expired_keys = []
         for key, info in list(self.active_polls.items()):
-            if now >= info['close_time']:
-                if await self._close_poll(info):
-                    expired_keys.append(key)
+            if now >= info['close_time'] and await self._close_poll(info):
+                expired_keys.append(key)
         for key in expired_keys:
             self.active_polls.pop(key, None)
 
     async def _close_poll(self, info: dict[str, Any]) -> bool:
         pid = info['poll_id']
-        async with self.semaphore:
+        async with self._semaphore:
             try:
                 await self.bot.stop_poll(chat_id=self.chat_id, message_id=info['message_id'])
             except exceptions.TelegramBadRequest as e:
@@ -190,5 +181,4 @@ class Scheduler:
 
     async def shutdown(self):
         self._running = False
-        await self.session.close()
         await self.storage.close()

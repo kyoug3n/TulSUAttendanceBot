@@ -6,14 +6,16 @@ import logging
 import os
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import Any
 
 import pandas as pd
 from aiogram import Bot, Dispatcher, Router, exceptions, types
-from aiogram.filters import Command
+from aiogram.filters import Command, Filter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import Message
 from dotenv import load_dotenv
 from openpyxl.styles import Alignment
 from openpyxl.utils import get_column_letter
@@ -21,285 +23,328 @@ from openpyxl.utils import get_column_letter
 from scheduler import Scheduler
 from storage import StorageManager
 
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+# ----- Configuration -----
+@dataclass(frozen=True)
+class Config:
+    token: str
+    chat_id: int
+    group_id: int
+    admin_ids: list[int]
+    poll_interval: float = 60.0
+    update_interval: float = 3600.0
+    poll_window: float = 300.0
+
+    @staticmethod
+    def _parse_admin_ids(raw: str) -> list[int]:
+        try:
+            return [int(x.strip()) for x in raw.strip('[]').split(',') if x.strip()]
+        except ValueError:
+            return []
+
+    @classmethod
+    def from_env(cls) -> 'Config':
+        load_dotenv()
+        token = os.getenv('TOKEN', '')
+        if not token or token == 'token':
+            raise RuntimeError('Environment variable TOKEN is invalid.')
+
+        chat_id = int(os.getenv('CHAT_ID', '0'))
+        group_id = int(os.getenv('GROUP_ID', '0'))
+        admin_ids = cls._parse_admin_ids(os.getenv('ATTENDANCE_ACCESS', '[]'))
+        poll_interval = float(os.getenv('POLL_CHECK_INTERVAL', '60'))
+        update_interval = float(os.getenv('SCHEDULE_UPDATE_INTERVAL', '3600'))
+        poll_window = float(os.getenv('POLL_CLOSURE_WINDOW', '300'))
+
+        return cls(
+            token=token,
+            chat_id=chat_id,
+            group_id=group_id,
+            admin_ids=admin_ids,
+            poll_interval=poll_interval,
+            update_interval=update_interval,
+            poll_window=poll_window
+        )
+
+
+# ----- Logging -----
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-router = Router()
-dp = Dispatcher()
-dp.include_router(router)
-storage = StorageManager()
-
+# ----- Validators -----
 NAME_PATTERN = re.compile(r'^[А-Яа-яЁё-]+$')
 
 
+def valid_name(name: str) -> bool:
+    name = name.strip()
+    return bool(NAME_PATTERN.fullmatch(name))
+
+
+async def validate_chat_id(bot: Bot, config: Config) -> None:
+    try:
+        chat = await bot.get_chat(config.chat_id)
+        if chat.type not in ('group', 'supergroup'):
+            raise RuntimeError(
+                f'Only groups and supergroups are supported. Invalid chat type: {chat.type}, ID: {chat.id}'
+            )
+    except exceptions.AiogramError as e:
+        raise RuntimeError(f'Could not fetch chat info: {e}')
+
+    return None
+
+
+class PrivateChatFilter(Filter):
+    async def __call__(self, message: types.Message) -> bool:
+        if message.chat.type != 'private':
+            await message.answer('Эта команда доступна только в личных сообщениях.')
+            return False
+        return True
+
+
+# ----- FSM States -----
 class Registration(StatesGroup):
     last_name = State()
     first_name = State()
 
 
-def valid_name(name: str) -> bool:
-    return bool(
-        NAME_PATTERN.fullmatch(name.strip()) and
-        len(name.strip().split()) == 1
-    )
+# ----- Main Bot Class -----
+class AttendanceBot:
+    def __init__(self, config: Config):
+        self.config = config
+        self.router = Router()
+        self.dispatcher = Dispatcher()
+        self.dispatcher.include_router(self.router)
+        self.bot: Bot | None = None
+        self.scheduler: Scheduler | None = None
+        self.storage = StorageManager()
 
+        self._setup_routes()
 
-@router.message(Command('start'))
-async def cmd_start(message: types.Message, state: FSMContext) -> None:
-    await state.clear()
+    def _setup_routes(self) -> None:
+        self.router.message(Command('start'))(self._on_start)
+        self.router.message(Command('edit_name'), PrivateChatFilter())(self._on_edit_name)
+        self.router.message(Command('display_name'), PrivateChatFilter())(self._on_display_name)
+        self.router.message(Registration.last_name)(self._on_last_name)
+        self.router.message(Registration.first_name)(self._on_first_name)
+        self.router.message(Command('export_attendance'), PrivateChatFilter())(self._on_export_attendance)
 
-    user_id = str(message.from_user.id)
-    user = await storage.get_user(user_id)
+        self.router.poll_answer()(self._on_poll_answer)
 
-    if message.chat.type == 'private' and (not user or not user.get('registered', False)):
+        self.router.errors()(self._on_error)
+
+    # ----- Helper Methods -----
+    @staticmethod
+    def _build_report(polls: list[dict[str, Any]], year: int, month: int) -> types.InputFile:
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:  # type: ignore
+            df = pd.DataFrame(polls)
+            for date_val, group in df.groupby('date'):
+                sheet_name = str(date_val).replace('.', '-')[:31]
+
+                records: dict[str, dict[str, str]] = {}
+                classes: set[str] = set()
+
+                for _, row in group.iterrows():
+                    cls = f"{row['class_name']} ({row['start_time']} - {row['end_time']})"
+                    classes.add(cls)
+                    for resp in json.loads(row['responses']):
+                        name = f"{resp['last_name']} {resp['first_name']}"
+                        opt = resp['option_ids'][0] if resp['option_ids'] else None
+                        mark = {0: 'Д', 1: 'Н', 2: 'П', 3: 'Б'}.get(opt, '')
+                        records.setdefault(name, {})[cls] = mark
+
+                classes_list = sorted(classes)
+                table = []
+                for student_name, answers in records.items():
+                    row_dict = {'Имя': student_name}
+                    for cls in classes_list:
+                        row_dict[cls] = answers.get(cls, '')
+                    table.append(row_dict)
+
+                df_day = pd.DataFrame(table, columns=['Имя'] + classes_list)
+                df_day = df_day.sort_values(by='Имя', ascending=False)
+                df_day.to_excel(writer, sheet_name=sheet_name, index=False)
+
+                ws = writer.sheets[sheet_name]
+                for idx, col in enumerate(df_day.columns, 1):
+                    max_length = max(
+                        df_day[col].astype(str).map(len).max(),
+                        len(str(col))
+                    )
+                    adjusted_width = max_length + 3
+                    col_letter = get_column_letter(idx)
+                    ws.column_dimensions[col_letter].width = adjusted_width
+
+                align = Alignment(horizontal='center', vertical='center')
+                for row in ws.iter_rows(1, ws.max_row, 1, ws.max_column):
+                    for cell in row:
+                        cell.alignment = align
+
+        output.seek(0)
+        return types.BufferedInputFile(output.getvalue(), filename=f"attendance_{year}-{month:02d}.xlsx")
+
+    # ----- Route Handlers -----
+    async def _on_start(self, message: types.Message, state: FSMContext) -> None:
+        await state.clear()
+        user_id = str(message.from_user.id)
+        user = await self.storage.get_user(user_id)
+
+        if message.chat.type == 'private' and not (user and user.get('registered')):
+            await message.answer('Введите вашу фамилию (одно слово на кириллице):')
+            await state.set_state(Registration.last_name)
+        else:
+            start_time = time.monotonic()
+            response = await message.answer('Бот запущен!')
+            ping = (time.monotonic() - start_time) * 1000
+
+            await response.edit_text(
+                f'Бот запущен!\n'
+                f'Пинг: {ping:.0f} мс\n'
+                f'(Жду следующей пары...)'
+            )
+
+    async def _on_edit_name(self, message: types.Message, state: FSMContext) -> None:
+        await state.clear()
         await message.answer('Введите вашу фамилию (одно слово на кириллице):')
-        await state.set_state(Registration.last_name)
-    else:
-        start_time = time.monotonic()
-        response = await message.answer('Bot running!')
-        ping = (time.monotonic() - start_time) * 1000
+        return await state.set_state(Registration.last_name)
 
-        await response.edit_text(
-            f'Bot running!\n'
-            f'Current ping: {ping:.0f} ms\n'
-            f'(Жду следующей пары...)'
-        )
+    async def _on_display_name(self, message: types.Message, state: FSMContext) -> Message:
+        last_not_specified = 'не указана'
+        first_not_specified = 'не указано'
 
+        await state.clear()
+        user_id = str(message.from_user.id)
+        user = await self.storage.get_user(user_id)
 
-@router.message(Command('edit_name'))
-async def cmd_edit_name(message: types.Message, state: FSMContext) -> None:
-    await state.clear()
+        last = user.get('last_name', last_not_specified) if user else last_not_specified
+        first = user.get('first_name', first_not_specified) if user else first_not_specified
 
-    if message.chat.type == 'private':
-        await message.answer('Введите вашу фамилию (одно слово на кириллице):')
-        await state.set_state(Registration.first_name)
+        if last == last_not_specified and first == first_not_specified:
+            return await message.answer('Ваше имя не указано.')
 
+        return await message.answer(f'Ваше имя: {last} {first}.')
 
-@router.message(Command('display_name'))
-async def cmd_display_name(message: types.Message, state: FSMContext) -> None:
-    await state.clear()
+    async def _on_last_name(self, message: types.Message, state: FSMContext) -> types.Message | None:
+        last = message.text
+        if not valid_name(last):
+            return await message.answer(
+                'Фамилия должна состоять из одного слова на кириллице. Пожалуйста, введите корректную фамилию:'
+            )
 
-    user_id = str(message.from_user.id)
-    user = await storage.get_user(user_id)
+        await state.update_data(last_name=last)
+        await message.answer('Отлично! Теперь введите ваше имя (одно слово на кириллице):')
 
-    ln = user.get('last_name', 'не указана') if user else 'не указана'
-    fn = user.get('first_name', 'не указано') if user else 'не указано'
+        return await state.set_state(Registration.first_name)
 
-    await message.answer(f'Ваше имя: {ln} {fn}.')
+    async def _on_first_name(self, message: types.Message, state: FSMContext) -> Message | None:
+        first = message.text
+        if not valid_name(first):
+            return await message.answer(
+                'Имя должно состоять из одного слова на кириллице. Пожалуйста, введите корректное имя:'
+            )
 
+        data = await state.get_data()
+        user_id = str(message.from_user.id)
 
-@router.message(Registration.last_name)
-async def handle_last_name(message: types.Message, state: FSMContext) -> Optional[types.Message]:
-    ln = message.text.strip()
-    if not valid_name(ln):
-        return await message.answer(
-            'Фамилия должна состоять из одного слова на кириллице. Пожалуйста, введите корректную фамилию:'
-        )
+        await self.storage.update_user(user_id, {
+            "username": message.from_user.username,
+            "last_name": data['last_name'],
+            "first_name": first,
+            "registered": True
+        })
 
-    await state.update_data(first_name=ln)
-    await message.answer('Отлично! Теперь введите ваше имя (одно слово на кириллице):')
-
-    return await state.set_state(Registration.first_name)
-
-
-@router.message(Registration.first_name)
-async def handle_first_name(message: types.Message, state: FSMContext) -> Optional[types.Message]:
-    fn = message.text.strip()
-    if not valid_name(fn):
-        return await message.answer(
-            'Имя должно состоять из одного слова на кириллице. Пожалуйста, введите корректное имя:'
-        )
-
-    data = await state.get_data()
-    user_id = str(message.from_user.id)
-
-    await storage.update_user(user_id, {
-        "username": message.from_user.username,
-        "last_name": data['last_name'],
-        "first_name": fn,
-        "registered": True
-    })
-
-    await message.answer(f"Спасибо, {data['last_name']} {fn}! Ваши данные сохранены.")
-    await state.clear()
-
-
-@router.message(Command('export_attendance'))
-async def cmd_export_attendance(message: types.Message, state: FSMContext) -> Optional[types.Message]:
-    admins: list[int] = [int(x.strip()) for x in str(os.getenv('ATTENDANCE_ACCESS'))[1:-1].split(',')]
-
-    if not (message.chat.type == 'private' and message.from_user.id in admins):
-        await message.answer('Эта команда доступна только администраторам.')
+        await message.answer(f"Спасибо, {data['last_name']} {first}! Ваши данные сохранены.")
         return await state.clear()
 
-    parts = message.text.strip().split()
-    now = datetime.now()
-    year, month = now.year, now.month
+    async def _on_export_attendance(self, message: types.Message, state: FSMContext) -> Message | None:
+        if state:
+            await state.clear()
 
-    if len(parts) > 1:
-        try:
-            year, month = map(int, parts[1].split('-', 1))
-        except ValueError:
-            return await message.answer("Используйте формат: /export_attendance YYYY-MM")
+        user_id = message.from_user.id
+        if user_id not in self.config.admin_ids:
+            await message.answer('Эта команда доступна только администраторам.')
+            return await state.clear()
 
-    await message.answer(f"Генерирую отчёт за {year}-{month:02d}…")
+        parts = message.text.strip().split()
+        now = datetime.now()
+        year, month = now.year, now.month
 
-    polls = await storage.get_past_polls_by_month(year, month)
-    if not polls:
-        return await message.answer("Нет данных за этот период.")
+        if len(parts) > 1:
+            try:
+                year, month = map(int, parts[1].split('-', 1))
+            except ValueError:
+                return await message.answer("Используйте формат: /export_attendance YYYY-MM")
 
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:  # type: ignore
-        df_polls = pd.DataFrame(polls)
-        for date_val, group in df_polls.groupby('date', sort=True):
-            date_str = str(date_val)
-            sheet_name = date_str.replace('.', '-')[:31]
+        await message.answer(f'Генерирую отчёт за {year}-{month:02d}…')
 
-            records: dict[str, dict[str,str]] = {}
-            classes: set[str] = set()
+        polls = await self.storage.get_past_polls_by_month(year, month)
+        if not polls:
+            return await message.answer('Нет данных за этот период.')
 
-            for _, row in group.iterrows():
-                cls = f'{row['class_name']} ({row["start_time"]} - {row["end_time"]})'
-                classes.add(cls)
-                for resp in json.loads(row['responses']):
-                    name = resp['last_name'] + ' ' + resp['first_name']
-                    opt = resp['option_ids'][0] if resp['option_ids'] else None
-                    mark = {0: 'Д', 1: 'Н', 2: 'П', 3: 'Б'}.get(opt, '')
-                    records.setdefault(name, {})[cls] = mark
+        file = self._build_report(polls, year, month)
+        return await message.answer_document(file)
 
-            classes_list = sorted(classes)
-            table = []
-            for student, answers in records.items():
-                row_dict = {'Имя': student}
-                for cls in classes_list:
-                    row_dict[cls] = answers.get(cls, '')
-                table.append(row_dict)
+    async def _on_poll_answer(self, poll_answer: types.PollAnswer) -> None:
+        user = poll_answer.user
 
-            df_day = pd.DataFrame(table, columns=['Имя'] + classes_list)
-            df_day = df_day.sort_values(by='Имя', ascending=False)
-            df_day.to_excel(writer, sheet_name=sheet_name, index=False)
-
-            ws = writer.sheets[sheet_name]
-            for idx, col in enumerate(df_day.columns, 1):
-                max_length = max(
-                    df_day[col].astype(str).map(len).max(),
-                    len(str(col))
-                )
-                adjusted_width = max_length + 6
-                col_letter = get_column_letter(idx)
-                ws.column_dimensions[col_letter].width = adjusted_width
-
-            align = Alignment(horizontal='center', vertical='center')
-            for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
-                for cell in row:
-                    cell.alignment = align
-
-    output.seek(0)
-    data = output.getvalue()
-    file = types.BufferedInputFile(data, filename=f"attendance_{year}-{month:02d}.xlsx")
-    return await message.answer_document(file)
-
-
-def register_handlers(router_instance: Router, storage_instance: StorageManager, scheduler_instance: Scheduler):
-    @router_instance.poll_answer()
-    async def handle_poll_answer(poll_answer: types.PollAnswer):
-        pid = poll_answer.poll_id
-        uid = poll_answer.user.id
-        uid_str = str(uid)
-        opts = poll_answer.option_ids
-
-        if local_user_info := await storage_instance.get_user(uid_str):
-            fn, ln = local_user_info.get('first_name', ''), local_user_info.get('last_name', '')
-        else:
-            fn, ln = poll_answer.user.first_name, poll_answer.user.last_name or ''
-        username = f'@{poll_answer.user.username}' if poll_answer.user.username else ''
-
-        await storage_instance.update_poll_response(
-            poll_id=pid,
-            user_id=uid_str,
-            option_ids=opts,
-            first_name=fn,
-            last_name=ln,
-            username=username
+        rec = {
+            'user_id': str(user.id),
+            'first_name': user.first_name,
+            'last_name': user.last_name or '',
+            'username': f"@{user.username}" if user.username else '',
+            'option_ids': poll_answer.option_ids
+        }
+        await self.storage.update_poll_response(
+            rec['user_id'], rec['option_ids'], rec['first_name'], rec['last_name'], rec['username']
         )
-
-        for rec in scheduler_instance.active_polls.values():
-            if rec['poll_id'] == pid:
-                resps = json.loads(rec['responses'])
-                resps.append({
-                    'user_id': uid_str,
-                    'first_name': fn,
-                    'last_name': ln,
-                    'username': username,
-                    'option_ids': opts
-                })
-                rec['responses'] = json.dumps(resps)
+        for entry in self.scheduler.active_polls.values():
+            if entry['poll_id'] == poll_answer.poll_id:
+                responses = json.loads(entry['responses'])
+                responses.append(rec)
+                entry['responses'] = json.dumps(responses)
                 break
 
+    async def _on_error(self, update: types.Update, exception: Exception | None = None) -> None:
+        logger.exception(f'Error for update {update}: {exception!r}')
 
-@router.errors()
-async def error_handler(update: types.Update, exception: Exception = None) -> None:
-    logger.exception(f'Update {update} caused error {exception!r}')
+    async def run(self) -> None:
+        await self.storage.connect()
+        self.bot = Bot(token=self.config.token)
+        self.scheduler = Scheduler(
+            bot=self.bot,
+            chat_id=self.config.chat_id,
+            group_id=self.config.group_id,
+            storage=self.storage,
+            poll_interval=self.config.poll_interval,
+            update_interval=self.config.update_interval,
+            poll_window=self.config.poll_window
+        )
 
-
-async def main() -> None:
-    load_dotenv()
-    token = os.getenv('TOKEN')
-    chat_id = int(os.getenv('CHAT_ID'))
-    group_id = int(os.getenv('GROUP_ID'))
-    poll_interval = float(os.getenv('POLL_CHECK_INTERVAL', '60'))
-    update_interval = float(os.getenv('SCHEDULE_UPDATE_INTERVAL', '3600'))
-    poll_window = float(os.getenv('POLL_CLOSURE_WINDOW', '300'))
-
-    if not token or token == 'token':
-        logger.critical('Environment variable TOKEN is not set.')
-        return
-
-    await storage.connect()
-
-    bot = Bot(token=token)
-    scheduler = Scheduler(
-        bot=bot,
-        chat_id=chat_id,
-        group_id=group_id,
-        storage=storage,
-        poll_interval=poll_interval,
-        update_interval=update_interval,
-        poll_window=poll_window
-    )
-    register_handlers(router, storage, scheduler)
-
-    async def validate_chat_id() -> bool:
         try:
-            chat = await bot.get_chat(chat_id)
-            return chat.type in ('group', 'supergroup')
-        except exceptions.AiogramError:
-            return False
+            await validate_chat_id(self.bot, self.config)
+        except RuntimeError as e:
+            logger.critical(e)
+            return None
 
-    if not await validate_chat_id():
-        logger.critical(f'Invalid chat ID: {chat_id}')
-        return
-
-    task: Optional[asyncio.Task] = None
-
-    try:
-        task = asyncio.create_task(scheduler.start())
-        await dp.start_polling(bot)
-    except Exception as e:
-        logger.exception(f'Unexpected error: {e}')
-    finally:
-        if task is not None:
-            task.cancel()
+        scheduler_task = asyncio.create_task(self.scheduler.start())
+        try:
+            await self.dispatcher.start_polling(self.bot)
+        finally:
+            scheduler_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await task
+                await scheduler_task
 
-        await scheduler.shutdown()
-        await bot.session.close()
-        await storage.close()
+        await self.scheduler.shutdown()
+        await self.bot.session.close()
+        await self.storage.close()
 
 
 if __name__ == '__main__':
     try:
-        asyncio.run(main())
+        attendance_bot = AttendanceBot(Config.from_env())
+        asyncio.run(attendance_bot.run())
     except KeyboardInterrupt:
         logger.info('Bot stopped by user.')

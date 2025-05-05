@@ -1,12 +1,12 @@
 import os
-from collections import defaultdict
 import logging
+from collections import defaultdict
 from datetime import datetime as dt, time
 from typing import Any, Final
 
 import aiohttp
 
-import test_schedule
+from test_schedule import get_test_schedule
 
 
 class ScheduleParser:
@@ -14,19 +14,19 @@ class ScheduleParser:
     DATE_FORMAT: Final[str] = '%d.%m.%Y'
     TIME_FORMAT: Final[str] = '%H:%M'
 
-    def __init__(self, group_id: int, session: aiohttp.ClientSession):
+    def __init__(self, group_id: int):
         self.logger = logging.getLogger(__name__)
         self.group_id = group_id
-        self.session = session
-        self.schedule = defaultdict(list)
+        self.session = aiohttp.ClientSession()
+        self.schedule: dict[str, list[dict[str, Any]]] = defaultdict(list)
 
     async def fetch(self) -> dict[str, list[dict[str, Any]]]:
         self.logger.info('Fetching schedule...')
         raw_list: list[dict[str, Any]] = []  # TODO: add last schedule saving
 
-        # TEST MODE (classes 2 min from bot launch)
+        # TEST MODE (classes 2 min from bot launch or periodic schedule refresh)
         if os.getenv('TEST_MODE', 'False').lower() == 'true':
-            raw_list = test_schedule.get_test_schedule()
+            raw_list = get_test_schedule()
         else:
             # real API fetch
             params = {'search_field': 'GROUP_P', 'search_value': self.group_id}
@@ -53,12 +53,12 @@ class ScheduleParser:
         return grouped
 
     def _parse_raw(self, raw: dict[str, Any]) -> dict[str, Any]:
-        date = raw.get('DATE_Z', '')
-        time_range = raw.get('TIME_Z', '')
+        date: str = raw.get('DATE_Z', '')
+        time_range: str = raw.get('TIME_Z', '')
+        class_name: str = raw.get('DISCIP', '')
         start_time, end_time = time_range.split(' - ')
 
-        class_name = raw.get('DISCIP', '')
-        shortened_class_name_map = {
+        shortened_class_name_map: dict[str, str] = {
             'Иностранный язык': 'Ин. яз.',
             'Современные информационные системы и технологии': 'СИСИТ',
             'Физическая культура и спорт (элективные модули)': 'Физра',
