@@ -149,6 +149,10 @@ class AttendanceBot:
 
                 for _, row in group.iterrows():
                     cls = f"{row['class_name']} ({row['start_time']} - {row['end_time']})"
+
+                    if cls in classes:
+                        cls = f"{cls} ({row['class_room']})"
+
                     classes.add(cls)
                     for resp in json.loads(row['responses']):
                         name = f"{resp['last_name']} {resp['first_name']}"
