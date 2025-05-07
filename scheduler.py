@@ -179,6 +179,7 @@ class Scheduler:
 
             await asyncio.sleep(self.poll_interval)
 
-    async def shutdown(self):
+    async def close(self):
         self._running = False
+        await self.parser.close()
         await self.storage.close()

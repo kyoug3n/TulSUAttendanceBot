@@ -163,6 +163,9 @@ class AttendanceBot:
                 classes_list = sorted(classes)
                 table = []
                 for student_name, answers in records.items():
+                    if isinstance(student_name, str) and student_name.startswith(('=', '+', '-', '@')):
+                        student_name = "'" + student_name  # excel injection protection
+
                     row_dict = {'Имя': student_name}
                     for cls in classes_list:
                         row_dict[cls] = answers.get(cls, '')
@@ -342,9 +345,8 @@ class AttendanceBot:
             with contextlib.suppress(asyncio.CancelledError):
                 await scheduler_task
 
-        await self.scheduler.shutdown()
+        await self.scheduler.close()
         await self.bot.session.close()
-        await self.storage.close()
 
 
 if __name__ == '__main__':

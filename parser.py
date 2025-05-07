@@ -95,3 +95,7 @@ class ScheduleParser:
         except (ValueError, KeyError) as e:
             self.logger.warning(f'Sorting error for entry {entry}: {e}')
             return dt.max, time.max, time.max
+
+    async def close(self):
+        if not self.session.closed:
+            await self.session.close()
