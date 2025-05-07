@@ -151,7 +151,7 @@ class AttendanceBot:
                     cls = f"{row['class_name']} ({row['start_time']} - {row['end_time']})"
 
                     if cls in classes:
-                        cls = f"{cls} ({row['class_room']})"
+                        cls = f"{cls} ({row['room']})"
 
                     classes.add(cls)
                     for resp in json.loads(row['responses']):
@@ -295,14 +295,15 @@ class AttendanceBot:
         user = poll_answer.user
 
         rec = {
+            'poll_id': poll_answer.poll_id,
             'user_id': str(user.id),
+            'option_ids': poll_answer.option_ids,
             'first_name': user.first_name,
             'last_name': user.last_name or '',
-            'username': f"@{user.username}" if user.username else '',
-            'option_ids': poll_answer.option_ids
+            'username': f"@{user.username}" if user.username else ''
         }
         await self.storage.update_poll_response(
-            rec['user_id'], rec['option_ids'], rec['first_name'], rec['last_name'], rec['username']
+            rec['poll_id'], rec['user_id'], rec['option_ids'], rec['first_name'], rec['last_name'], rec['username']
         )
         for entry in self.scheduler.active_polls.values():
             if entry['poll_id'] == poll_answer.poll_id:

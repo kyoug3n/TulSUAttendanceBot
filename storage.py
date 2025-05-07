@@ -223,7 +223,7 @@ class StorageManager:
         else:
             end = f"{year:04d}-{month+1:02d}-01"
         query = """
-            SELECT date, start_time, end_time, class_name, responses 
+            SELECT date, start_time, end_time, class_name, room, responses 
             FROM past_polls
             WHERE close_time >= ? AND close_time < ?
             ORDER BY date, start_time
