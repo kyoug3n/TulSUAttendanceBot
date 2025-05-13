@@ -85,7 +85,7 @@ class Scheduler:
                 msg = await self.bot.send_poll(
                     chat_id=self.chat_id,
                     question=question,
-                    options=['Да', 'Нет', 'Пикнулся', 'На больничном'],
+                    options=['Да', 'Нет', 'Пикма', 'На больничном'],
                     is_anonymous=False,
                     allows_multiple_answers=False,
                 )
