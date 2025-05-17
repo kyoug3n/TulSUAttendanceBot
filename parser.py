@@ -6,75 +6,87 @@ from typing import Any, Final
 
 import aiohttp
 
+from storage import StorageManager
 from test_schedule import get_test_schedule
 
 
+logger = logging.getLogger(__name__)
+
+
 class ScheduleParser:
-    API_ENDPOINT: Final[str] = 'https://tulsu.ru/schedule/queries/GetSchedule.php'
+    SCHEDULE_ENDPOINT: Final[str] = 'https://tulsu.ru/schedule/queries/GetSchedule.php'
     DATE_FORMAT: Final[str] = '%d.%m.%Y'
     TIME_FORMAT: Final[str] = '%H:%M'
 
-    def __init__(self, group_id: int):
-        self.logger = logging.getLogger(__name__)
-        self.group_id = group_id
-        self.session = aiohttp.ClientSession()
+    def __init__(
+            self, config,
+            session: aiohttp.ClientSession, storage: StorageManager,
+            discipline_settings: tuple[list, dict, dict]
+    ):
+        self.config = config
+        self.session = session
+        self.storage = storage
+        self.discipline_settings = discipline_settings
+
+        self.group_id = self.config.group_id
         self.schedule: dict[str, list[dict[str, Any]]] = defaultdict(list)
 
     async def fetch(self) -> dict[str, list[dict[str, Any]]]:
-        self.logger.info('Fetching schedule...')
-        raw_list: list[dict[str, Any]] = []  # TODO: add last schedule saving
+        logger.info(f'Fetching schedule for group {self.group_id}...')
 
-        # TEST MODE (classes 2 min from bot launch or periodic schedule refresh)
-        if os.getenv('TEST_MODE', 'False').lower() == 'true':
-            raw_list = get_test_schedule()
-        else:
-            # real API fetch
-            params = {'search_field': 'GROUP_P', 'search_value': self.group_id}
-            try:
-                async with self.session.get(self.API_ENDPOINT, params=params, timeout=10) as response:
-                    response.raise_for_status()
-                    raw_list = await response.json()
-            except aiohttp.web.HTTPException as e:
-                self.logger.error(f'Schedule fetch failed: {e}')
+        raw_list: list[dict[str, Any]] = await self._retrieve_raw()
+        parsed = []
 
-        parsed = [self._parse_raw(item) for item in raw_list]
+        for item in raw_list:
+            entry = self._parse_sched_entry(item)
+            if entry is not None:
+                parsed.append(entry)
         parsed.sort(key=self._sort_key)
 
-        grouped: dict[str, list[dict[str, Any]]] = {}
         include_exams = os.getenv('INCLUDE_EXAMS', 'False').lower() != 'false'
-
+        grouped: dict[str, list[dict[str, Any]]] = {}
         for entry in parsed:
             if include_exams or entry['class_type'] not in ('зч', 'ДЗ', 'Э', 'КР'):
                 grouped.setdefault(entry['date'], []).append(entry)
 
         self.schedule = grouped
-        self.logger.info('Schedule updated.')
+        logger.info('Schedule updated.')
 
         return grouped
 
-    def _parse_raw(self, raw: dict[str, Any]) -> dict[str, Any]:
+    async def _retrieve_raw(self) -> list[dict[str, Any]]:
+        # classes 2 min from bot launch or periodic schedule refresh
+        if self.config.test_mode:
+            logger.info('TEST MODE ENABLED! Using mock schedule.')
+            return get_test_schedule()
+
+        params = {'search_field': 'GROUP_P', 'search_value': self.group_id}
+        try:
+            async with self.session.get(self.SCHEDULE_ENDPOINT, params=params, timeout=10) as resp:
+                resp.raise_for_status()
+                if data := await resp.json():
+                    await self.storage.save_last_schedule(self.group_id, data)
+                return data
+
+        except aiohttp.web.HTTPError as e:
+            logger.error(f'Schedule fetch failed: {e}')
+            if cache := await self.storage.get_last_schedule(self.group_id):
+                logger.info('Loaded schedule fallback from DB cache')
+                return cache
+            return []
+
+    def _parse_sched_entry(self, raw: dict[str, Any]) -> dict[str, str] | None:
         date: str = raw.get('DATE_Z', '')
         time_range: str = raw.get('TIME_Z', '')
-        class_name: str = raw.get('DISCIP', '')
         start_time, end_time = time_range.split(' - ')
+        class_name = raw.get('DISCIP', '').strip()
 
-        shortened_class_name_map: dict[str, str] = {
-            'Иностранный язык': 'Ин. яз.',
-            'Современные информационные системы и технологии': 'СИСИТ',
-            'Физическая культура и спорт (элективные модули)': 'Физра',
-            'Программирование': 'Прога',
-            'Тайм-менеджмент и селф-менеджмент': 'ТМ',
-            'Технологии самоорганизации и саморазвития личности': 'Самоорганизация',
-            'Введение в математический анализ': 'Матан',
-            'Основы информационной безопасности': 'ОиБ',
-            'Психология лидерства и командной работы': 'Психология',
-            'История России': 'История',
-            'Алгебра и геометрия': 'Алгебра',
-            'Культура речи и нормы делового взаимодействия': 'Культура речи',
-            'Теория алгоритмов и структуры данных': 'Алгоритмы',
-            'Философия и методология мышления': 'Философия'
-        }
-        class_name = shortened_class_name_map.get(class_name, class_name)
+        if class_name in self.discipline_settings[0]:
+            return None
+
+        alias_map = self.discipline_settings[2]
+        if class_name in alias_map:
+            class_name = alias_map[class_name]
 
         return {
             'date': date,
@@ -93,9 +105,5 @@ class ScheduleParser:
             end = dt.strptime(entry['end_time'], self.TIME_FORMAT).time()
             return date, start, end
         except (ValueError, KeyError) as e:
-            self.logger.warning(f'Sorting error for entry {entry}: {e}')
+            logger.warning(f'Sorting error for entry {entry}: {e}')
             return dt.max, time.max, time.max
-
-    async def close(self):
-        if not self.session.closed:
-            await self.session.close()
