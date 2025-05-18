@@ -110,9 +110,9 @@ def extract_quoted(text: str) -> list[str]:
 async def is_valid_chat_type(bot: Bot, config: Config) -> None:
     try:
         chat = await bot.get_chat(config.chat_id)
-        if chat.type != ChatType.GROUP:
+        if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
             raise RuntimeError(
-                f'Only groups are supported. Invalid chat type: {chat.type}, ID: {chat.id}'
+                f'Only groups and supergroups are supported. Invalid chat type: {chat.type}, ID: {chat.id}'
             )
     except AiogramError as e:
         raise RuntimeError(f'Could not fetch chat info: {e}')
