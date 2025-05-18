@@ -218,7 +218,7 @@ class AttendanceBot:
                 classes: set[str] = set()
 
                 for _, row in group.iterrows():
-                    cls_label = f'{row['class_name']} ({row['start_time']} - {row['end_time']})'
+                    cls_label = f'{row["class_name"]} ({row["start_time"]} - {row["end_time"]})'
 
                     if cls_label in classes:
                         prof_last_name = row['prof'].split()[1]
@@ -336,7 +336,7 @@ class AttendanceBot:
             'registered': True
         })
 
-        await message.answer(f'Спасибо, {data['last_name']} {first}! Ваши данные сохранены.')
+        await message.answer(f'Спасибо, {data["last_name"]} {first}! Ваши данные сохранены.')
         return await state.clear()
 
     async def _on_export_attendance(self, message: Message, state: FSMContext) -> Message | None:
