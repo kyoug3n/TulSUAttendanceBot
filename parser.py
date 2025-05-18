@@ -43,10 +43,9 @@ class ScheduleParser:
                 parsed.append(entry)
         parsed.sort(key=self._sort_key)
 
-        include_exams = os.getenv('INCLUDE_EXAMS', 'False').lower() != 'false'
         grouped: dict[str, list[dict[str, Any]]] = {}
         for entry in parsed:
-            if include_exams or entry['class_type'] not in ('зч', 'ДЗ', 'Э', 'КР'):
+            if self.config.include_exams or entry['class_type'] not in ('зч', 'ДЗ', 'Э', 'КР'):
                 grouped.setdefault(entry['date'], []).append(entry)
 
         self.schedule = grouped

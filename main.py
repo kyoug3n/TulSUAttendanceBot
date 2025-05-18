@@ -45,11 +45,12 @@ class Config:
     poll_interval: float = 60.0
     prefetch_offset: float = 300.0
     poll_window: float = 300.0
+    include_exams: bool = False
 
     @staticmethod
     def _parse_admin_ids(raw: str) -> list[int]:
         try:
-            return [int(x.strip()) for x in raw.strip('[]').split(',') if x.strip()]
+            return [int(x.strip()) for x in raw.split(',') if x.strip()]
         except ValueError:
             return []
 
@@ -69,8 +70,9 @@ class Config:
         admin_ids = cls._parse_admin_ids(os.getenv('ADMIN_COMMANDS_ACCESS', '[]'))
         test_mode = cls._convert_to_bool(os.getenv('TEST_MODE', 'false'))
         poll_interval = float(os.getenv('POLL_CHECK_INTERVAL', '60'))
-        prefetch_offset = float(os.getenv('SCHEDULE_PREFETCH_OFFSET', '300'))
         poll_window = float(os.getenv('POLL_CLOSURE_WINDOW', '300'))
+        prefetch_offset = float(os.getenv('SCHEDULE_PREFETCH_OFFSET', '300'))
+        include_exams = cls._convert_to_bool(os.getenv('INCLUDE_EXAMS', 'false'))
 
         return cls(
             token=token,
@@ -79,8 +81,9 @@ class Config:
             admin_ids=admin_ids,
             test_mode=test_mode,
             poll_interval=poll_interval,
+            poll_window=poll_window,
             prefetch_offset=prefetch_offset,
-            poll_window=poll_window
+            include_exams=include_exams
         )
 
 
