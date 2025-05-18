@@ -248,7 +248,7 @@ class AttendanceBot:
                     table.append(row_dict)
 
                 df_day = pd.DataFrame(table, columns=['Имя'] + classes_list)
-                df_day = df_day.sort_values(by='Имя', ascending=False)
+                df_day = df_day.sort_values(by='Имя')
                 df_day.to_excel(writer, sheet_name=sheet_name, index=False)
 
                 ws = writer.sheets[sheet_name]
