@@ -214,16 +214,17 @@ class AttendanceBot:
             for date_val, group in df.groupby('date'):
                 sheet_name = str(date_val).replace('.', '-')[:31]
 
+                label_to_time: dict[str, str] = {}
                 records: dict[str, dict[str, str]] = {}
-                classes: set[str] = set()
 
                 for _, row in group.iterrows():
                     cls_label = f'{row["class_name"]} ({row["start_time"]} - {row["end_time"]})'
 
-                    if cls_label in classes:
+                    if cls_label in label_to_time:
                         prof_last_name = row['prof'].split()[1]
                         cls_label = f'{cls_label} ({prof_last_name})'
-                    classes.add(cls_label)
+
+                    label_to_time[cls_label] = row["start_time"]
 
                     for resp in json.loads(row['responses']):
                         user = await self.storage.get_user(resp['user_id']) or {}
@@ -235,7 +236,11 @@ class AttendanceBot:
                         mark = {0: 'Д', 1: 'Н', 2: 'П', 3: 'Б', 4: 'НМГ'}.get(opt, '')
                         records.setdefault(name, {})[cls_label] = mark
 
-                classes_list = sorted(classes)
+                classes_list = sorted(
+                    label_to_time.keys(),
+                    key=lambda lbl: datetime.strptime(label_to_time[lbl], "%H:%M")
+                )
+
                 table = []
                 for student_name, answers in records.items():
                     safe_name = student_name
