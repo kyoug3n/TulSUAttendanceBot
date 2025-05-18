@@ -50,7 +50,7 @@ class Config:
     @staticmethod
     def _parse_admin_ids(raw: str) -> list[int]:
         try:
-            return [int(x.strip()) for x in raw.split(',') if x.strip()]
+            return [int(x.strip()) for x in raw.strip('[]').split(',') if x.strip()]
         except ValueError:
             return []
 
