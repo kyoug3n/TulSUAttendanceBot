@@ -102,7 +102,10 @@ class Scheduler:
                 hh, mm = map(int, item['TIME_START'].split(':'))
                 times.add(datetime.time(hour=hh, minute=mm))
             self.start_times = sorted(times)
-            logger.info(f'Loaded schedule time groups: {self.start_times}')
+
+            # format start times as HH:MM
+            formatted_times = [t.strftime('%H:%M') for t in self.start_times]
+            logger.info(f'Loaded schedule time groups: {formatted_times}')
         except Exception as e:
             logger.error(f'Failed loading schedule time groups: {e}')
             self.start_times = []

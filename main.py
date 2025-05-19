@@ -386,23 +386,23 @@ class AttendanceBot:
         await query.answer()
         action = query.data.split(':', maxsplit=1)[1]  # set_alias, set_nmg, exclude
         await state.update_data(action=action)
-        class_name_query = 'Введите полное название дисциплины в кавычках, например: "Введение в математический анализ"'
+        class_name_query = ('Введите полное название дисциплины в кавычках,'
+                            'например: "Введение в математический анализ"')
 
         if action == 'set_alias':
             await query.message.answer(
-                'Эта функция позволяет сократить название дисциплины в опросах и таблицах.\n\n'
+                f'Эта функция позволяет сократить название дисциплины в опросах и таблицах.\n\n'
                 f'{class_name_query}'
             )
         if action == 'set_nmg':
             await query.message.answer(
-                'Эта функция позволяет указать, '
-                'будет ли добавлена опция "Не моя группа" в опросах '
-                'для дисциплины с указанным типом занятия.\n\n'
+                f'Эта функция позволяет добавить опцию "Не моя группа"'
+                f'в опросах для дисциплины с указанным типом занятия.\n\n'
                 f'{class_name_query}'
             )
         if action == 'exclude':
             await query.message.answer(
-                'Эта функция позволяет исключить дисциплину из опросов.\n\n'
+                f'Эта функция позволяет исключить дисциплину из опросов.\n\n'
                 f'{class_name_query}'
             )
 
