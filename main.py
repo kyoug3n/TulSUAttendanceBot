@@ -6,7 +6,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -46,11 +46,12 @@ class Config:
     prefetch_offset: float = 300.0
     poll_window: float = 300.0
     include_exams: bool = False
+    nmg_types: list[str] = field(default_factory=list)
 
     @staticmethod
     def _parse_admin_ids(raw: str) -> list[int]:
         try:
-            return [int(x.strip()) for x in raw.strip('[]').split(',') if x.strip()]
+            return [int(x.strip()) for x in raw.split(',') if x.strip()]
         except ValueError:
             return []
 
@@ -67,12 +68,13 @@ class Config:
 
         chat_id = int(os.getenv('CHAT_ID', '0'))
         group_id = int(os.getenv('GROUP_ID', '0'))
-        admin_ids = cls._parse_admin_ids(os.getenv('ADMIN_COMMANDS_ACCESS', '[]'))
+        admin_ids = cls._parse_admin_ids(os.getenv('ADMIN_COMMANDS_ACCESS'))
         test_mode = cls._convert_to_bool(os.getenv('TEST_MODE', 'false'))
         poll_interval = float(os.getenv('POLL_CHECK_INTERVAL', '60'))
         poll_window = float(os.getenv('POLL_CLOSURE_WINDOW', '300'))
         prefetch_offset = float(os.getenv('SCHEDULE_PREFETCH_OFFSET', '300'))
         include_exams = cls._convert_to_bool(os.getenv('INCLUDE_EXAMS', 'false'))
+        nmg_types = os.getenv('NMG_TYPES', 'practice,lab').split(',')
 
         return cls(
             token=token,
@@ -83,7 +85,8 @@ class Config:
             poll_interval=poll_interval,
             poll_window=poll_window,
             prefetch_offset=prefetch_offset,
-            include_exams=include_exams
+            include_exams=include_exams,
+            nmg_types=nmg_types
         )
 
 
@@ -370,7 +373,7 @@ class AttendanceBot:
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(text='✏️ Сократить', callback_data='md:set_alias'),
-                InlineKeyboardButton(text='👥 НМГ', callback_data='md:set_nmg'),  # not my group / не моя группа
+                InlineKeyboardButton(text='👥 Подгруппы', callback_data='md:set_nmg'),  # not my group / не моя группа
             ],
             [
                 InlineKeyboardButton(text='🗑️ Исключить', callback_data='md:exclude'),
@@ -383,9 +386,26 @@ class AttendanceBot:
         await query.answer()
         action = query.data.split(':', maxsplit=1)[1]  # set_alias, set_nmg, exclude
         await state.update_data(action=action)
-        await query.message.answer(
-            'Введите полное название дисциплины в кавычках, например: "Введение в математический анализ"'
-        )
+        class_name_query = 'Введите полное название дисциплины в кавычках, например: "Введение в математический анализ"'
+
+        if action == 'set_alias':
+            await query.message.answer(
+                'Эта функция позволяет сократить название дисциплины в опросах и таблицах.\n\n'
+                f'{class_name_query}'
+            )
+        if action == 'set_nmg':
+            await query.message.answer(
+                'Эта функция позволяет указать, '
+                'будет ли добавлена опция "Не моя группа" в опросах '
+                'для дисциплины с указанным типом занятия.\n\n'
+                f'{class_name_query}'
+            )
+        if action == 'exclude':
+            await query.message.answer(
+                'Эта функция позволяет исключить дисциплину из опросов.\n\n'
+                f'{class_name_query}'
+            )
+
         return await state.set_state(ManageDisciplineState.full_class_name)
 
     async def _on_receive_full_class_name(self, message: Message, state: FSMContext) -> Message | None:
@@ -403,11 +423,15 @@ class AttendanceBot:
         await state.update_data(full_name=full)
 
         if action == 'set_alias':
-            await message.answer(f'Теперь введите сокращение для "{full}":')
+            await message.answer(f'Теперь введите сокращение для "{full}" в кавычках:')
             await state.set_state(ManageDisciplineState.alias)
 
         if action == 'set_nmg':
-            await message.answer(f'Теперь введите тип занятия для "{full}":')
+            formatted_nmg_types = str(self.config.nmg_types).strip('[]')
+            await message.answer(
+                f'Теперь введите тип занятия для "{full}" в кавычках.'
+                f'Допустимые значения: {formatted_nmg_types}'
+            )
             await state.set_state(ManageDisciplineState.class_type)
 
         if action == 'exclude':

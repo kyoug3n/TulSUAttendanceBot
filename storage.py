@@ -6,19 +6,21 @@ from typing import Any
 import aiosqlite
 
 
+logger = logging.getLogger(__name__)
+
+
 class StorageManager:
     DB_FILE = Path('db.sqlite3')
 
     def __init__(self):
-        self.logger = logging.getLogger(__name__)
         self.conn: aiosqlite.Connection | None = None
 
     async def connect(self):
         self.conn = await aiosqlite.connect(self.DB_FILE)
         self.conn.row_factory = aiosqlite.Row
-        self.logger.info('DB connection established')
+        logger.info('DB connection established')
         await self._init_db()
-        self.logger.info('DB initialized')
+        logger.info('DB initialized')
 
     async def _init_db(self):
         assert self.conn
@@ -395,4 +397,4 @@ class StorageManager:
                 await self.conn.rollback()
             await self.conn.close()
             self.conn = None
-            self.logger.info('DB connection closed')
+            logger.info('DB connection closed')

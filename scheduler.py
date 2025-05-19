@@ -151,21 +151,31 @@ class Scheduler:
         await self._close_expired_polls(now)
 
     async def _send_poll(self, cls: dict[str, Any], key: str) -> None:
+        # extract info from class dict
+        api_class_name = cls['class_name']
+        api_class_type = cls['class_type']
+        start_time = cls['start_time']
+        end_time = cls['end_time']
+
         options_default = ['Да', 'Нет', 'Пикма', 'На больничном']
         options_nmg = [*options_default, 'Не моя группа']
-        is_nmg = False
 
-        for class_name, class_type in self.discipline_settings[1].items():
-            if cls['class_name'] == class_name and cls['class_type'] == class_type:
-                is_nmg = True
+        # resolve class name to be used in the poll
+        alias_map = self.discipline_settings[2]
+        final_class_name = alias_map.get(api_class_name, api_class_name)
 
+        # determine if poll will contain "Не моя группа" option
+        nmg_map = self.discipline_settings[1]
+        is_nmg = api_class_name in nmg_map and nmg_map.get(api_class_name) == api_class_type
         options = options_nmg if is_nmg else options_default
+
+        question = f'{final_class_name} в {start_time} - {end_time}'
 
         async with self._semaphore:
             try:
                 msg = await self.bot.send_poll(
                     chat_id=self.chat_id,
-                    question=f"{cls['class_name']} в {cls['start_time']} - {cls['end_time']}",
+                    question=question,
                     options=options,
                     is_anonymous=False,
                     allows_multiple_answers=False,
@@ -217,6 +227,7 @@ class Scheduler:
                 await self.bot.stop_poll(chat_id=self.chat_id, message_id=info['message_id'])
         except exceptions.TelegramBadRequest as e:
             err_msg = str(e)
+
             # poll already closed -> archive
             if 'has already been closed' in err_msg:
                 logger.warning(f'Poll {poll_id} already closed: {err_msg}')

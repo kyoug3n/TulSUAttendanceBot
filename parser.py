@@ -1,4 +1,3 @@
-import os
 import logging
 from collections import defaultdict
 from datetime import datetime as dt, time
@@ -45,7 +44,7 @@ class ScheduleParser:
 
         grouped: dict[str, list[dict[str, Any]]] = {}
         for entry in parsed:
-            if self.config.include_exams or entry['class_type'] not in ('зч', 'ДЗ', 'Э', 'КР'):
+            if self.config.include_exams or entry['class_type'] != 'default':  # "default" = exams
                 grouped.setdefault(entry['date'], []).append(entry)
 
         self.schedule = grouped
@@ -75,7 +74,6 @@ class ScheduleParser:
             return []
 
     def _parse_sched_entry(self, raw: dict[str, Any]) -> dict[str, str] | None:
-        date: str = raw.get('DATE_Z', '')
         time_range: str = raw.get('TIME_Z', '')
         start_time, end_time = time_range.split(' - ')
         class_name = raw.get('DISCIP', '').strip()
@@ -83,18 +81,14 @@ class ScheduleParser:
         if class_name in self.discipline_settings[0]:
             return None
 
-        alias_map = self.discipline_settings[2]
-        if class_name in alias_map:
-            class_name = alias_map[class_name]
-
         return {
-            'date': date,
+            'date': raw.get('DATE_Z', ''),
             'start_time': start_time,
             'end_time': end_time,
             'class_name': class_name,
             'prof': raw.get('PREP', ''),
             'room': raw.get('AUD', ''),
-            'class_type': raw.get('KOW', ''),
+            'class_type': raw.get('CLASS', '')  # values: "lecture", "practice", "lab", "default". "default" = exams
         }
 
     def _sort_key(self, entry: dict[str, Any]) -> tuple[dt, time, time]:
